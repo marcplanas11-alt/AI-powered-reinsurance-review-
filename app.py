@@ -1,7 +1,11 @@
 import datetime
-import streamlit as st
+import os
+
 import anthropic
+import streamlit as st
 from pypdf import PdfReader
+
+DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 st.set_page_config(
     page_title="Reinsurance Contract Review AI",
@@ -22,15 +26,12 @@ st.markdown(
     }
     .main-header h1 { color: white; margin: 0; font-size: 2rem; }
     .main-header p { color: #cce0f5; margin: 0.5rem 0 0 0; font-size: 1rem; }
-    .agent-card {
-        background: #f8fafc;
-        border-left: 4px solid #2d6a9f;
-        padding: 1rem 1.2rem;
-        border-radius: 6px;
-        margin-bottom: 0.8rem;
+    .sidebar-section {
+        background: #f1f5f9;
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1rem;
     }
-    .agent-card.success { border-left-color: #28a745; }
-    .agent-card.running { border-left-color: #ffc107; }
     .metric-box {
         background: white;
         border: 1px solid #e2e8f0;
@@ -41,10 +42,11 @@ st.markdown(
     }
     .metric-box .value { font-size: 1.8rem; font-weight: 700; color: #1a3a5c; }
     .metric-box .label { font-size: 0.8rem; color: #64748b; margin-top: 0.2rem; }
-    .sidebar-section {
-        background: #f1f5f9;
-        border-radius: 8px;
+    .warning-box {
+        background: #fff7ed;
+        border-left: 4px solid #f97316;
         padding: 1rem;
+        border-radius: 6px;
         margin-bottom: 1rem;
     }
     </style>
@@ -52,25 +54,40 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Header ──────────────────────────────────────────────────────────────────
 st.markdown(
     """
     <div class="main-header">
         <h1>📋 AI-Powered Reinsurance Contract Review</h1>
-        <p>Three-agent AI workflow: Compliance · Technical Terms · Executive Summary</p>
+        <p>Production-style three-agent workflow: Compliance · Technical Terms · Executive Summary</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+st.markdown(
+    """
+    <div class="warning-box">
+    <b>Interview-safe positioning:</b> this is a production-style prototype for AI-assisted
+    reinsurance contract review. It supports human reviewers and does not replace legal,
+    compliance, underwriting or contract approval judgement.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
 
     api_key = st.text_input(
         "Anthropic API Key",
         type="password",
-        help="Enter your Anthropic API key. It is used only during this session and never stored.",
+        help="Used only during this Streamlit session and not stored by the app.",
+    )
+
+    model_name = st.text_input(
+        "Claude model",
+        value=DEFAULT_MODEL,
+        help="Can also be set with ANTHROPIC_MODEL. Default is selected for contract analysis quality.",
     )
 
     st.markdown("---")
@@ -78,7 +95,7 @@ with st.sidebar:
 
     input_mode = st.radio(
         "Input method",
-        ["Upload PDF", "Paste text", "Use sample contract"],
+        ["Use sample contract", "Upload PDF", "Paste text"],
         index=0,
     )
 
@@ -96,13 +113,8 @@ with st.sidebar:
     )
 
     st.caption(
-        "This tool supports human review and does not replace legal, compliance, or underwriting judgement."
+        "This tool supports human review and does not replace legal, compliance, underwriting or contract approval judgement."
     )
-
-# ── Main area input ──────────────────────────────────────────────────────────
-uploaded_file = None
-pasted_text = ""
-use_sample = False
 
 SAMPLE_CONTRACT = """
 BINDING AUTHORITY AGREEMENT
@@ -141,49 +153,64 @@ The Reinsurer reserves the right to audit the Coverholder's records. The frequen
 notice period for audits are not specified.
 """
 
-col_main = st.container()
+uploaded_file = None
+pasted_text = ""
+use_sample = input_mode == "Use sample contract"
 
-with col_main:
-    if input_mode == "Upload PDF":
-        uploaded_file = st.file_uploader(
-            "Upload reinsurance contract (PDF)", type=["pdf"], label_visibility="collapsed"
-        )
-        if uploaded_file:
-            st.success(f"✅ Uploaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
-    elif input_mode == "Paste text":
-        pasted_text = st.text_area(
-            "Paste contract text", height=200, placeholder="Paste the contract text here…"
-        )
-    else:
-        use_sample = True
-        st.info("Using the built-in sample binding authority agreement.")
+if input_mode == "Upload PDF":
+    uploaded_file = st.file_uploader(
+        "Upload reinsurance contract (PDF)",
+        type=["pdf"],
+        label_visibility="collapsed",
+    )
+    if uploaded_file:
+        st.success(f"✅ Uploaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
+elif input_mode == "Paste text":
+    pasted_text = st.text_area(
+        "Paste contract text",
+        height=240,
+        placeholder="Paste the contract text here…",
+    )
+else:
+    st.info("Using the built-in synthetic binding authority agreement.")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(file):
+def extract_text_from_pdf(file) -> str:
     reader = PdfReader(file)
-    pages = [p.extract_text() for p in reader.pages if p.extract_text()]
+    pages = [page.extract_text() for page in reader.pages if page.extract_text()]
     return "\n".join(pages)
 
 
-def get_client(key):
+def get_client(key: str):
     return anthropic.Anthropic(api_key=key)
 
 
-def compliance_agent(client, contract_text):
+def call_claude(client, model: str, prompt: str, max_tokens: int = 1200) -> str:
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text
+
+
+def compliance_agent(client, contract_text: str, model: str) -> str:
     prompt = f"""You are a reinsurance compliance analyst.
 
 Analyse the contract below and identify ONLY compliance-related issues.
 
 Focus on:
-- sanctions clauses (including specificity of regimes)
-- regulatory obligations (including DORA)
+- sanctions clauses, including specificity of applicable regimes
+- regulatory obligations, including DORA
 - missing compliance clauses
 - red flags requiring human review
 
 Do NOT analyse technical contract terms.
+Do NOT provide legal advice.
+Do NOT approve or reject the contract.
 
-Return structured markdown with:
+Return structured markdown with these sections:
 1. Sanctions Clauses
 2. Regulatory Clauses
 3. Missing Clauses
@@ -192,15 +219,10 @@ Return structured markdown with:
 
 Contract:
 {contract_text}"""
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text
+    return call_claude(client, model, prompt)
 
 
-def terms_agent(client, contract_text):
+def terms_agent(client, contract_text: str, model: str) -> str:
     prompt = f"""You are a reinsurance technical analyst.
 
 Extract ONLY operational and technical terms from this contract.
@@ -212,8 +234,9 @@ Focus on:
 - unclear or ambiguous wording
 
 Do NOT analyse compliance or regulatory issues.
+Do NOT approve or reject the contract.
 
-Return structured markdown with:
+Return structured markdown with these sections:
 1. Limits
 2. Bordereaux Obligations
 3. Reporting Frequency
@@ -221,42 +244,34 @@ Return structured markdown with:
 
 Contract:
 {contract_text}"""
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text
+    return call_claude(client, model, prompt)
 
 
-def summary_agent(client, compliance_output, terms_output):
+def summary_agent(client, compliance_output: str, terms_output: str, model: str) -> str:
     prompt = f"""You are a senior insurance operations reviewer.
 
-Based on the following analyses:
+Based on the following analyses, prepare a concise business-facing summary.
 
-COMPLIANCE:
+COMPLIANCE ANALYSIS:
 {compliance_output}
 
-TECHNICAL TERMS:
+TECHNICAL TERMS ANALYSIS:
 {terms_output}
 
 Provide:
-- Top 5 risks
-- Key contract weaknesses
-- Priority actions
-- Human review recommendation (Yes/No + reason)
+1. Top 5 risks
+2. Key contract weaknesses
+3. Priority actions
+4. Human review recommendation (Yes/No + reason)
 
-Be concise, structured, and business-oriented."""
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text
+Be concise, structured and business-oriented.
+Do not provide legal advice.
+Do not approve or reject the contract."""
+    return call_claude(client, model, prompt)
 
 
-def build_report(compliance_out, terms_out, summary_out, source_label):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+def build_report(compliance_out: str, terms_out: str, summary_out: str, source_label: str) -> str:
+    timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""# AI Reinsurance Contract Review Report
 Generated: {timestamp}
 Source: {source_label}
@@ -280,11 +295,11 @@ Source: {source_label}
 {summary_out}
 
 ---
-*This report was generated by the AI-Powered Reinsurance Review tool and supports human review only.*
+
+*This report was generated by the AI-Powered Reinsurance Review tool and supports human review only. It is not legal, compliance, underwriting or contract approval advice.*
 """
 
 
-# ── Run button ───────────────────────────────────────────────────────────────
 st.markdown("---")
 run_col, _ = st.columns([1, 3])
 with run_col:
@@ -297,12 +312,13 @@ if run:
         st.error("⚠️ Please upload a PDF contract.")
     elif input_mode == "Paste text" and not pasted_text.strip():
         st.error("⚠️ Please paste some contract text.")
+    elif not model_name.strip():
+        st.error("⚠️ Please enter a Claude model name.")
     else:
-        # ── Extract text (before try so st.stop() isn't swallowed) ───────────
         with st.spinner("📄 Extracting contract text…"):
             if use_sample:
                 contract_text = SAMPLE_CONTRACT
-                source_label = "Sample contract"
+                source_label = "Built-in synthetic sample contract"
             elif input_mode == "Upload PDF":
                 contract_text = extract_text_from_pdf(uploaded_file)
                 source_label = uploaded_file.name
@@ -316,41 +332,29 @@ if run:
 
         try:
             client = get_client(api_key)
-
-            # ── Progress display ────────────────────────────────────────────
             progress_bar = st.progress(0, text="Starting agent pipeline…")
             status_area = st.empty()
 
-            # Agent 1
             status_area.markdown("🔍 **Compliance Agent** is analysing the contract…")
-            compliance_output = compliance_agent(client, contract_text)
+            compliance_output = compliance_agent(client, contract_text, model_name.strip())
             progress_bar.progress(33, text="Compliance review complete")
 
-            # Agent 2
             status_area.markdown("📊 **Technical Terms Agent** is extracting contract terms…")
-            terms_output = terms_agent(client, contract_text)
+            terms_output = terms_agent(client, contract_text, model_name.strip())
             progress_bar.progress(66, text="Technical review complete")
 
-            # Agent 3
             status_area.markdown("📝 **Summary Agent** is consolidating findings…")
-            summary_output = summary_agent(client, compliance_output, terms_output)
+            summary_output = summary_agent(client, compliance_output, terms_output, model_name.strip())
             progress_bar.progress(100, text="Review complete")
             status_area.empty()
 
             st.success("✅ Review completed successfully.")
 
-            # ── Metrics row ─────────────────────────────────────────────────
             m1, m2, m3, m4 = st.columns(4)
             word_count = len(contract_text.split())
             lower_out = compliance_output.lower()
-            # count both bare ⚠ and the variation-selector form ⚠️
-            compliance_flags = (
-                lower_out.count("red flag")
-                + lower_out.count("⚠️")  # ⚠️
-                + lower_out.count("⚠")         # ⚠  (bare, deduplicated below)
-            )
-            # Avoid double-counting: bare ⚠ also matches inside ⚠️
-            compliance_flags -= lower_out.count("⚠️")
+            compliance_flags = lower_out.count("red flag") + lower_out.count("⚠️")
+
             with m1:
                 st.markdown(
                     f'<div class="metric-box"><div class="value">{word_count:,}</div><div class="label">Contract words</div></div>',
@@ -368,35 +372,29 @@ if run:
                 )
             with m4:
                 st.markdown(
-                    f'<div class="metric-box"><div class="value">✓</div><div class="label">Human review</div></div>',
+                    '<div class="metric-box"><div class="value">✓</div><div class="label">Human review</div></div>',
                     unsafe_allow_html=True,
                 )
 
             st.markdown("")
-
-            # ── Tabs ─────────────────────────────────────────────────────────
             tab1, tab2, tab3, tab4 = st.tabs(
                 ["📋 Compliance", "📊 Technical Terms", "📝 Executive Summary", "🔍 Contract Text"]
             )
 
             with tab1:
                 st.markdown(compliance_output)
-
             with tab2:
                 st.markdown(terms_output)
-
             with tab3:
                 st.markdown(summary_output)
-
             with tab4:
                 st.text_area(
-                    "Extracted contract text (first 5 000 characters)",
+                    "Extracted contract text (first 5,000 characters)",
                     value=contract_text[:5000],
                     height=300,
                     disabled=True,
                 )
 
-            # ── Download ──────────────────────────────────────────────────────
             st.markdown("---")
             report_md = build_report(compliance_output, terms_output, summary_output, source_label)
             st.download_button(
@@ -409,5 +407,5 @@ if run:
 
         except anthropic.AuthenticationError:
             st.error("❌ Invalid API key. Please check your Anthropic API key and try again.")
-        except Exception as e:
-            st.error(f"❌ An error occurred: {e}")
+        except Exception as exc:
+            st.error(f"❌ An error occurred: {exc}")
